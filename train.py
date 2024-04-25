@@ -16,8 +16,7 @@
 Main entry point for model training. Please refer to README.md for usage instructions.
 """
 
-import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 import logging
 import random
 
@@ -27,34 +26,26 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # Hide excessive tensorflow debug mess
 import sys
 import time
 import gin
-import pandas as pd
-import fbgemm_gpu
+import fbgemm_gpu  # noqa: F401, E402
 
 from absl import app, flags
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-# profiling
-from fvcore.nn import FlopCountAnalysis, flop_count_str, ActivationCountAnalysis
-
 from data.reco_dataset import get_reco_dataset
-from data.eval import get_eval_state, eval_metrics_v2_from_tensors, add_to_summary_writer
+from data.eval import _avg, get_eval_state, eval_metrics_v2_from_tensors, add_to_summary_writer
 from indexing.utils import get_top_k_module
 from modeling.sequential.autoregressive_losses import InBatchNegativesSampler, LocalNegativesSampler, SampledSoftmaxLoss, BCELoss
 from modeling.sequential.encoder_utils import get_sequential_encoder
-from modeling.sequential.embedding_modules import EmbeddingModule, CategoricalEmbeddingModule, LocalEmbeddingModule
-from modeling.sequential.input_features_preprocessors import InputFeaturesPreprocessorModule, LearnablePositionalEmbeddingInputFeaturesPreprocessor
+from modeling.sequential.embedding_modules import EmbeddingModule, LocalEmbeddingModule
+from modeling.sequential.input_features_preprocessors import LearnablePositionalEmbeddingInputFeaturesPreprocessor
 from modeling.sequential.output_postprocessors import L2NormEmbeddingPostprocessor, LayerNormEmbeddingPostprocessor
-from modeling.sequential.sasrec import SASRec
-from modeling.sequential.hstu import HSTU
-from modeling.sequential.features import movielens_seq_features_from_row, SequentialFeatures
+from modeling.sequential.features import movielens_seq_features_from_row
 from modeling.similarity_utils import get_similarity_function
-from modeling.initialization import init_mlp_xavier_weights_zero_bias
 from trainer.data_loader import create_data_loader
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -76,23 +67,6 @@ def setup(rank: int, world_size: int, master_port: int) -> None:
 
 def cleanup():
     dist.destroy_process_group()
-
-
-def _avg(x) -> float:
-      return sum(x) / len(x)
-
-
-def profile_fvcore(
-    model: torch.nn.Module,
-    example_inputs: Tuple[Any, ...],
-    detailed: bool,
-) -> None:
-    fca = FlopCountAnalysis(model, example_inputs)
-    aca = ActivationCountAnalysis(model, example_inputs)
-    if detailed:
-        fcs = flop_count_str(fca)
-        print(f'flop_count_str: {fcs}')
-    print(f'FLOPS: fca.total()={fca.total()}, activations: aca.total()={aca.total()}')
 
 
 @gin.configurable
@@ -167,13 +141,7 @@ def train_fn(
     )
 
     model_debug_str = main_module
-    if embedding_module_type == "categorical":
-        embedding_module: EmbeddingModule = CategoricalEmbeddingModule(
-            num_items=dataset.max_item_id,
-            item_embedding_dim=item_embedding_dim,
-            item_id_to_category_id=id_to_category,
-        )
-    elif embedding_module_type == "local":
+    if embedding_module_type == "local":
         embedding_module: EmbeddingModule = LocalEmbeddingModule(
             num_items=dataset.max_item_id,
             item_embedding_dim=item_embedding_dim,
@@ -326,7 +294,7 @@ def train_fn(
                         item_embeddings=item_embeddings,
                         item_ids=item_ids,
                     ),
-                    device=device, 
+                    device=device,
                     float_dtype=torch.bfloat16 if main_module_bf16 else None,
                 )
                 eval_dict = eval_metrics_v2_from_tensors(
@@ -334,13 +302,13 @@ def train_fn(
                     user_max_batch_size=eval_user_max_batch_size,
                     dtype=torch.bfloat16 if main_module_bf16 else None,
                 )
-                if rank == 0:
-                    add_to_summary_writer(writer, batch_id, eval_dict, prefix="eval")
+                add_to_summary_writer(writer, batch_id, eval_dict, prefix="eval", world_size=world_size)
                 logging.info(
                     f"rank {rank}:  batch-stat (eval): iter {batch_id} (epoch {epoch}): " +
-                    f"NDCG@10 {_avg(eval_dict['ndcg@10']):.4f}, "
-                    f"HR@10 {_avg(eval_dict['hr@10']):.4f}, HR@50 {_avg(eval_dict['hr@50']):.4f}, " +
-                    f"MRR {_avg(eval_dict['mrr']):.4f} ")
+                    f"NDCG@10 {_avg(eval_dict['ndcg@10'], world_size):.4f}, "
+                    f"HR@10 {_avg(eval_dict['hr@10'], world_size):.4f}, "
+                    f"HR@50 {_avg(eval_dict['hr@50'], world_size):.4f}, " +
+                    f"MRR {_avg(eval_dict['mrr'], world_size):.4f} ")
                 model.train()
 
             # TODO: consider separating this out?
@@ -423,45 +391,48 @@ def train_fn(
                 item_embeddings=item_embeddings,
                 item_ids=item_ids,
             ),
-            device=device, 
+            device=device,
             float_dtype=torch.bfloat16 if main_module_bf16 else None,
         )
-        raw_eval_logits = []
         for eval_iter, row in enumerate(iter(eval_data_loader)):
             seq_features, target_ids, target_ratings = movielens_seq_features_from_row(row, device=device, max_output_length=gr_output_length + 1)
             eval_dict = eval_metrics_v2_from_tensors(
                 eval_state, model.module, seq_features, target_ids=target_ids, target_ratings=target_ratings,
                 user_max_batch_size=eval_user_max_batch_size,
-                include_full_matrices=False,
                 dtype=torch.bfloat16 if main_module_bf16 else None,
             )
 
             if eval_dict_all is None:
-                eval_dict_all = eval_dict
-            else:
+                eval_dict_all = {}
                 for k, v in eval_dict.items():
-                    eval_dict_all[k] = eval_dict_all[k] + v
-                del eval_dict
+                    eval_dict_all[k] = []
+
+            for k, v in eval_dict.items():
+                eval_dict_all[k] = eval_dict_all[k] + [v]
+            del eval_dict
 
             if (eval_iter + 1 >= partial_eval_num_iters) and (not is_full_eval(epoch)):
                 logging.info(f"Truncating epoch {epoch} eval to {eval_iter + 1} iters to save cost..")
                 break
-        ndcg_10 = _avg(eval_dict_all["ndcg@10"])
-        ndcg_50 = _avg(eval_dict_all["ndcg@50"])
-        hr_10 = _avg(eval_dict_all["hr@10"])
-        hr_50 = _avg(eval_dict_all["hr@50"])
-        mrr = _avg(eval_dict_all["mrr"])
-        if rank == 0:
-            add_to_summary_writer(writer, batch_id=epoch, metrics=eval_dict_all, prefix="eval_epoch")
-            if full_eval_every_n > 1 and is_full_eval(epoch):
-                add_to_summary_writer(writer, batch_id=epoch, metrics=eval_dict_all, prefix="eval_epoch_full")
-            if epoch > 0 and (epoch % save_ckpt_every_n) == 0:
-                # saves partial checkpoint.
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': opt.state_dict(),
-                }, f"./ckpts/{model_desc}_ep{epoch}")
+
+        for k, v in eval_dict_all.items():
+            eval_dict_all[k] = torch.cat(v, dim=-1)
+
+        ndcg_10 = _avg(eval_dict_all["ndcg@10"], world_size=world_size)
+        ndcg_50 = _avg(eval_dict_all["ndcg@50"], world_size=world_size)
+        hr_10 = _avg(eval_dict_all["hr@10"], world_size=world_size)
+        hr_50 = _avg(eval_dict_all["hr@50"], world_size=world_size)
+        mrr = _avg(eval_dict_all["mrr"], world_size=world_size)
+
+        add_to_summary_writer(writer, batch_id=epoch, metrics=eval_dict_all, prefix="eval_epoch", world_size=world_size)
+        if full_eval_every_n > 1 and is_full_eval(epoch):
+            add_to_summary_writer(writer, batch_id=epoch, metrics=eval_dict_all, prefix="eval_epoch_full", world_size=world_size)
+        if epoch > 0 and (epoch % save_ckpt_every_n) == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': opt.state_dict(),
+            }, f"./ckpts/{model_desc}_ep{epoch}")
 
         logging.info(f"rank {rank}: eval @ epoch {epoch} in {time.time() - eval_start_time:.2f}s: "
                      f"NDCG@10 {ndcg_10:.4f}, NDCG@50 {ndcg_50:.4f}, HR@10 {hr_10:.4f}, HR@50 {hr_50:.4f}, MRR {mrr:.4f}")
